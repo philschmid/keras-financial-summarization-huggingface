@@ -1,0 +1,4 @@
+tensorboard
+transformers
+rogue_score
+datasets>=1.17.0
