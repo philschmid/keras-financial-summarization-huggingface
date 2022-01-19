@@ -1,5 +1,5 @@
 tensorboard
-transformers
+git+https://github.com/huggingface/transformers.git@master
 rogue_score
 nltk
 datasets>=1.17.0
