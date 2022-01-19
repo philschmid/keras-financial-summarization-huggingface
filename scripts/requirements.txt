@@ -1,4 +1,5 @@
 tensorboard
 transformers
 rogue_score
+nltk
 datasets>=1.17.0

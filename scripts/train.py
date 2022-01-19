@@ -3,42 +3,22 @@ import logging
 import os
 import sys
 
+from tqdm import tqdm
 import numpy as np
+
 import tensorflow as tf
-import datasets
+from datasets import load_dataset,load_metric
 from transformers import (
-    ViTFeatureExtractor,
-    TFViTForImageClassification,
-    DefaultDataCollator,
+    AutoTokenizer,
+    TFAutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
     create_optimizer,
 )
+import nltk
+nltk.download("punkt")
+from nltk.tokenize import sent_tokenize
 from transformers.keras_callbacks import PushToHubCallback
-from tensorflow.keras.callbacks import TensorBoard as TensorboardCallback,EarlyStopping
-
-
-def create_image_folder_dataset(root_path):
-  """creates `Dataset` from image folder structure"""
-  
-  # get class names by folders names
-  _CLASS_NAMES= os.listdir(root_path)
-  # defines `datasets` features`
-  features=datasets.Features({
-                      "img": datasets.Image(),
-                      "label": datasets.features.ClassLabel(names=_CLASS_NAMES),
-                  })
-  # temp list holding datapoints for creation
-  img_data_files=[]
-  label_data_files=[]
-  # load images into list for creation
-  for img_class in os.listdir(root_path):
-    for img in os.listdir(os.path.join(root_path,img_class)):
-      path_=os.path.join(root_path,img_class,img)
-      img_data_files.append(path_)
-      label_data_files.append(img_class)
-  # create dataset
-  ds = datasets.Dataset.from_dict({"img":img_data_files,"label":label_data_files},features=features)
-  return ds
-
+from tensorflow.keras.callbacks import TensorBoard as TensorboardCallback
 
 
 if __name__ == "__main__":
@@ -47,6 +27,7 @@ if __name__ == "__main__":
 
     # Hyperparameters sent by the client are passed as command-line arguments to the script.
     parser.add_argument("--model_id", type=str)
+    parser.add_argument("--dataset_file_name", type=str)
     parser.add_argument("--num_train_epochs", type=int, default=5)
     parser.add_argument("--train_batch_size", type=int, default=16)
     parser.add_argument("--eval_batch_size", type=int, default=32)
@@ -75,53 +56,61 @@ if __name__ == "__main__":
 
     # Load Dataset from local path
     dataset_path="/opt/ml/input/data/dataset"
-    eurosat_ds = create_image_folder_dataset(dataset_path)
-    img_class_labels = eurosat_ds.features["label"].names
+    ds = load_dataset('json', data_files=os.path.join(dataset_path, args.dataset_file_name))
+    to_remove_columns = ["pub_time","labels"]
+
+    ds = ds["train"].remove_columns(to_remove_columns)
 
 
-    feature_extractor = ViTFeatureExtractor.from_pretrained(args.model_id)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    
+    # preprocess dataset
+    max_input_length = 512
+    max_target_length = 64
+    def preprocess_function(examples):
+        model_inputs = tokenizer(
+            examples["text"], max_length=max_input_length, truncation=True
+        )
+        # Set up the tokenizer for targets
+        with tokenizer.as_target_tokenizer():
+            labels = tokenizer(
+                examples["title"], max_length=max_target_length, truncation=True
+            )
 
-    # basic processing (only resizing)
-    def process(examples):
-        examples.update(feature_extractor(examples['img'], ))
-        return examples
-
-    # we are also renaming our label col to labels to use `.to_tf_dataset` later
-    eurosat_ds = eurosat_ds.rename_column("label", "labels")
-    processed_dataset = eurosat_ds.map(process, batched=True)
-
-
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+    # run processing
+    tokenized_datasets = ds.map(preprocess_function, batched=True)
+    
+    # test size will be 15% of train dataset
     test_size=.15
 
-    processed_dataset = processed_dataset.shuffle().train_test_split(test_size=test_size)
+    processed_dataset = tokenized_datasets.shuffle().train_test_split(test_size=test_size)
 
-    # convert to TF datasets
+
+    # load model
+    model = TFAutoModelForSeq2SeqLM.from_pretrained(args.model_id)
+
+    # enable mixed precision
+    if args.fp16:
+        tf.keras.mixed_precision.set_global_policy("mixed_float16")
+
     # Data collator that will dynamically pad the inputs received, as well as the labels.
-    data_collator = DefaultDataCollator(return_tensors="tf")
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, return_tensors="tf")
 
     # converting our train dataset to tf.data.Dataset
     tf_train_dataset = processed_dataset["train"].to_tf_dataset(
-    columns=['pixel_values'],
-    label_cols=["labels"],
+    columns=["input_ids", "attention_mask", "labels"],
     shuffle=True,
     batch_size=args.train_batch_size,
     collate_fn=data_collator)
 
     # converting our test dataset to tf.data.Dataset
     tf_eval_dataset = processed_dataset["test"].to_tf_dataset(
-    columns=['pixel_values'],
-    label_cols=["labels"],
+    columns=["input_ids", "attention_mask", "labels"],
     shuffle=True,
     batch_size=args.eval_batch_size,
     collate_fn=data_collator)
-
-    # Prepare model labels - useful in inference API
-    id2label = {str(i): label for i, label in enumerate(img_class_labels)}
-    label2id = {v: k for k, v in id2label.items()}
-
-    # enable mixed precision training
-    if args.fp16:
-        tf.keras.mixed_precision.set_global_policy("mixed_float16")
 
     # create optimizer wight weigh decay
     num_train_steps = len(tf_train_dataset) * args.num_train_epochs
@@ -132,13 +121,8 @@ if __name__ == "__main__":
         num_warmup_steps=args.num_warmup_steps,
     )
 
-    # load pre-trained ViT model
-    model = TFViTForImageClassification.from_pretrained(
-        args.model_id,
-        num_labels=len(img_class_labels),
-        id2label=id2label,
-        label2id=label2id,
-    )
+    # compile model
+    model.compile(optimizer=optimizer)
 
     # define loss
     loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
@@ -157,7 +141,6 @@ if __name__ == "__main__":
 
     callbacks = []
     callbacks.append(TensorboardCallback(log_dir=os.path.join(args.model_dir, "logs")))
-    callbacks.append(EarlyStopping(monitor="val_accuracy",patience=1))
 
     # TODO: add with new DLC supporting Transformers 4.14.1
     # if args.hub_token:
@@ -179,6 +162,32 @@ if __name__ == "__main__":
         epochs=args.num_train_epochs,
     )
 
+    # evaluate
+    metric = load_metric("rouge")
+
+
+    def evaluate(model, dataset):
+        all_predictions = []
+        all_labels = []
+        for batch in tqdm(dataset):
+            predictions = model.generate(batch["input_ids"])
+            decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+            labels = batch["labels"].numpy()
+            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+            decoded_preds = ["\n".join(sent_tokenize(pred.strip())) for pred in decoded_preds]
+            decoded_labels = ["\n".join(sent_tokenize(label.strip())) for label in decoded_labels]
+            all_predictions.extend(decoded_preds)
+            all_labels.extend(decoded_labels)
+            result = metric.compute(
+                predictions=decoded_preds, references=decoded_labels, use_stemmer=True
+            )
+        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+        return {k: round(v, 4) for k, v in result.items()}
+
+    results = evaluate(model, tf_eval_dataset)
+    logger.info(results)
+
     # Save result
     model.save_pretrained(args.model_dir)
-    feature_extractor.save_pretrained(args.model_dir)
+    tokenizer.save_pretrained(args.model_dir)
